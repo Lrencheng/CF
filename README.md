@@ -9,6 +9,8 @@ Complementary Filter in MATLAB based on IMU attitude estimation code from ANO TC
 项目参考ANO飞控拓空者P2的解算方案。
 >拓空者P2的源码没有开源，请支持正版
 
+链接：[ANO飞控](https://www.anotc.com/wiki/welcome)
+
 ## 功能特性
 
 - 基于互补滤波算法的姿态估计
