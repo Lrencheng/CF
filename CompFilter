@@ -1,0 +1,560 @@
+classdef CompFilter < handle
+    %传感器处理函数
+    %部分参考匿名ANO拓空者Pro的解算方法
+    %数学物理常数
+    properties(Access=public)
+        pi=3.1416;
+        gravAcc=9.81;
+    end
+    properties (Access=public)
+        %公共属性
+        %时间参数
+        dt=0.001%默认imu采样频率为1000hz
+        gpsdt=0.2%默认gps采样频率为5hz
+        ratio;%比率
+        %输入
+        %{
+             imu数据结构包含以下字段：
+             - q:     四元数(Qe->b,表示从导航坐标系到机体坐标系的旋转)
+             - accel: 加速度计数据结构（enable-使能开关, value-测量值, bias-偏置值）
+             - gyro:  陀螺仪数据结构（enable-使能开关, value-测量值, bias-偏置值）
+             - mag:   磁力计数据结构（enable-使能开关, value-测量值, bias-偏置值）
+             - Roll:  滚转角（绕X轴旋转角度）
+             - Yaw:   偏航角（绕Z轴旋转角度）
+             - Pitch: 俯仰角（绕Y轴旋转角度）
+             - m_acc: 运动加速度(机体坐标系)
+             - w_acc: 运动加速度(导航坐标系)
+             - h_acc: 运动加速度（航向坐标系）
+             - w_mag: 磁力计数据（导航坐标系）
+             - gacc_deadzone:重力加速度计死区（小于该阈值视为噪声）
+             - w_north_mag: 磁北方向（导航坐标系）
+        %}
+        imu=struct(...
+            'q',quaternion(1.0,0,0,0),...
+            'accel',struct('enable',true,'value',[0,0,0],'bias',[0,0,0]),...
+            'gyro',struct('enable',true,'value',[0,0,0],'bias',[0,0,0]),...
+            'mag',struct('enable',true,'value',[0,0,0],'bias',[0,0,0]),...
+            'Roll',0.0,...
+            'Yaw',0.0,...
+            'Pitch',0.0,...
+            'm_acc',zeros(1,3),...
+            'grav_acc',[0,0,9.81],...
+            'w_acc',zeros(1,3),...
+            'h_acc',zeros(1,3),...
+            'w_mag',zeros(1,3),...
+            'gacc_deadzone',[0.05,0.05,0.05],...
+            'w_north_mag',zeros(1,3)...
+        )
+        %{
+            gps数据结构包含以下字段：
+             - enable:     传感器使能
+             - lla:        经度，维度，高度
+             - gpsvel:     gps测量速度
+             - bias:       gps偏差
+        %}
+        gps=struct(...
+            'enable',true,...
+            'lla',[0,0,0],...
+            'gpsvel',[0,0,0],...
+            'bias',[0,0,0]...
+        )
+        %配置参数
+        config=struct(...
+            'filtercoef',struct(...   %滤波系数
+                'kp_accel',0.1,...  
+                'ki_accel',0.1,...    
+                'kp_mag',0.02,...
+                'kp_gps',0.8 ...
+            ),...
+            'fs',struct(...           %采样频率
+                'accelFs',100,...
+                'gyroFs',100,...
+                'magFs',100,...
+                'gpsFs',5 ...
+            )...
+        );
+        %测试变量接口 1:真/使用 0：假/禁用
+        USE_LENGTH_LIM=1;
+        USE_MAG=1;
+        USE_ACC=1;
+        USE_GYR=1;
+        %输出
+        %位置向量
+        pos=[0,0,0];
+        
+    end
+    properties (Access=private)
+        %私有属性
+        %gps参考点(home点)
+        home=[0,0,0];
+    end
+
+    %公共函数，提供外部函数接口
+    methods(Access=public)
+        %初始化函数
+        function obj=CompFilter(varargin)
+            if nargin==0
+                %默认初始化
+            elseif nargin==1&&isequal(size(varargin{1}), [1 3])
+                obj.home=varargin{1};
+            elseif nargin==2&&isstruct(varargin{2})&&isequal(size(varargin{1}), [1 3])
+                %初始化传入refloc和配置结构体
+                obj.SensorInit(varargin{1},varargin{2});
+            else 
+                error('初始化函数传入参数错误');
+            end
+        end
+        %sensordata数据帧
+        %{
+            sensordata=struct(...
+                'imu',struct(...
+                    'accel',[x,y,z],...
+                    'gyro',[x,y,z],...
+                    'mag',[x,y,z] ...
+                ),...
+                'gps',struct(...
+                    'lla',[x,y,z],...
+                    'gpsvel',[x,y,z]...
+                )...
+            ).......
+        %}
+        %-----传感器初始化函数
+        function SensorInit(obj,refloc,NewConfig)
+            %设置home点
+            obj.home=refloc;
+            %获取配置
+            obj.getconfig(NewConfig);
+            %更新一些数据
+            obj.dt=1/obj.config.fs.accelFs;
+            obj.gpsdt=1/obj.config.fs.gpsFs;
+            obj.ratio=fix(obj.dt/obj.gpsdt);
+        end
+        %配置更新函数
+        function getconfig(obj,NewConfig)
+            obj.config=NewConfig;
+        end
+        %传感器数据更新函数
+        %可以优化一下，这里imudata=sensordata.('imu')的操作相当于创建一个
+        %新的结构体变量，这效率很低
+        function getdata(obj,sensordata)
+            if isfield(sensordata, 'imu')
+                imudata=sensordata.('imu');%动态字段访问
+                if isfield(imudata, 'accel')
+                    obj.imu.accel.value = imudata.accel;
+                else
+                    error('accel数据不存在');
+                end
+                if isfield(imudata, 'gyro')
+                    obj.imu.gyro.value = imudata.gyro;
+                else
+                    error('gyro数据不存在');
+                end
+                if isfield(imudata, 'mag')
+                    obj.imu.mag.value = imudata.mag;
+                else
+                    error('mag数据不存在');
+                end
+            else
+                error('imu 数据不存在');
+            end
+            %初始化gps数据
+            if isfield(sensordata,'gps')
+                gpsdata=sensordata.('gps');
+                 % 确保gpsdata是结构体
+                if ~isstruct(gpsdata)
+                    error('GPS数据必须是结构体');
+                end
+                if isfield(gpsdata,'lla')
+                    obj.gps.lla=gpsdata.lla;
+                else
+                    error('lla数据不存在');
+                end
+                if isfield(gpsdata,'gpsvel')
+                    obj.gps.gpsvel=gpsdata.gpsvel;
+                else
+                    error('gpsvel数据不存在');
+                end
+            else
+                error('imu 数据不存在');
+            end
+        end
+        %姿态更新函数
+        function ImuUpdate(obj)
+            obj.Data_process();
+            obj.IMU_update(obj.dt,obj.imu.gyro.value,obj.imu.accel.value,obj.imu.mag.value);
+        end
+        %-----传感器使能函数
+        function enableSensor(obj,sensorname,state)
+            if isfield(obj.imu, sensorname)
+                obj.imu.(sensorname).enable =state;
+            else
+                error(['传感器 ' sensorname ' 不存在']);
+            end
+        end
+        %位置更新函数
+
+    end
+    %% 传感器校准相关函数与变量
+    properties(Access=public)
+        %传感器校准时间步
+        cali_Nav=100;%需要传感器在cali_Nav*dt时间内保持稳定
+        %imu校准数据结构体
+        imu_cali=struct(...
+            'accel_sum_av',[0,0,0],... %平均值
+            'gyro_sum_av',[0,0,0],...
+            'mag_sum_av',[0,0,0],...
+            'accel_stable',1,...       %值为1，表示加速度数据稳定
+            'gyro_stable',1,...        %值为1，表示角速度数据稳定
+            'mag_stable',1 ...         %值为1，表示磁力计数据稳定
+        )
+        %存放低通滤波处理后的数据
+        accel_temp=zeros(1,3);
+        gyro_temp=zeros(1,3);
+        %数据稳定判断阈值                                                                                              
+        ACC_CKS_VAL=25.0;
+        GYRO_CKS_VAL=3.0;
+        %传感器校准计数器
+        time_cnt=0;
+        unstable_cnt=0;
+    end
+    methods(Access=public)
+        %加速度计和陀螺仪传感器稳定检测函数
+        function obj=AccGyroStable_check(obj,dt,accel_in,gyro_in)
+            %参数 
+            %{
+                dt: 采样时间间隔
+                accel_in:加速度输入数据      维度：[1,3]
+                gyro_in: 陀螺仪输入数据      维度：[1,3]
+            %}
+            accel_delta_temp=zeros(1,3);
+            gyro_delta_temp=zeros(1,3);
+            for i=1:3
+                obj.accel_temp(i)=obj.LPF_1_(2.0,dt,accel_in(i),obj.accel_temp(i));
+                obj.gyro_temp(i)=obj.LPF_1_(2.0,dt,gyro_in(i),obj.gyro_temp(i));
+                %计算差值
+                accel_delta_temp(i)=accel_in(i)-obj.accel_temp(i);
+                gyro_delta_temp(i)=gyro_in(i)-obj.gyro_temp(i);
+            end
+            %阈值判断
+            if norm(accel_delta_temp)>obj.ACC_CKS_VAL
+                obj.imu_cali.accel_stable=0;
+            else 
+                obj.imu_cali.accel_stable=1;
+            end
+            if norm(gyro_delta_temp)>obj.GYRO_CKS_VAL
+                obj.imu_cali.gyro_stable=0;
+            else 
+                obj.imu_cali.gyro_stable=1;
+            end
+        end
+        %imu校准函数
+        function state=imu_calibrate(obj)
+            %参数：CaliData 描述：校准数据 类型：结构体
+            %返回值：传感器校准结果 1：成功 0：失败
+            %获取数据及步长
+            acceldata=obj.imu.accel.value;
+            gyrodata=obj.imu.gyro.value;
+            magdata=obj.imu.mag.value;
+            %计数器更新
+            obj.time_cnt=obj.time_cnt+1;
+            %传感器数据检测
+            obj.AccGyroStable_check(obj.dt,acceldata,gyrodata);
+            %更新偏差
+            if obj.time_cnt<=obj.cali_Nav  
+                if obj.imu_cali.accel_stable && obj.imu_cali.gyro_stable
+                    obj.imu_cali.accel_sum_av=obj.imu_cali.accel_sum_av+acceldata/obj.cali_Nav;
+                    obj.imu_cali.gyro_sum_av=obj.imu_cali.gyro_sum_av+gyrodata/obj.cali_Nav;
+                    obj.imu_cali.mag_sum_av=obj.imu_cali.mag_sum_av+magdata/obj.cali_Nav;
+                else
+                    obj.unstable_cnt=obj.unstable_cnt+1;
+                    if obj.unstable_cnt>10
+                        %校准失败
+                        state=-1;
+                        error('加速度或者陀螺仪数据不稳定');
+                    end
+                end
+                %正在校准
+                state=0;
+            end
+            if obj.time_cnt==obj.cali_Nav
+                %偏差=平均值-基本值（理论初值）
+                obj.imu.accel.bias=obj.imu_cali.accel_sum_av-[0,0,obj.gravAcc];
+                obj.imu.gyro.bias=obj.imu_cali.gyro_sum_av-[0,0,0];
+                %定义磁北方向
+                obj.imu.w_north_mag=obj.imu_cali.mag_sum_av;
+                obj.wxy_north_mag=obj.imu.w_north_mag(1:2)/norm(obj.imu.w_north_mag(1:2));
+                %校准完成
+                state=1;
+            end
+        end
+    end
+
+    %% 姿态结算相关函数与变量
+    properties(Access=public)
+        %旋转矩阵：从机体坐标系到导航坐标系
+        rotate_matrix=eye(3,'double');
+        %四元数更新矩阵
+        Omega=zeros(4,4);
+        %坐标轴投影向量（从导航坐标系到体坐标系）
+        x_vec=[1,0,0];
+        y_vec=[0,1,0];
+        z_vec=[0,0,1];
+        %水平面方向向量
+        hx_vec=[1,0];
+        %修正开关使能
+        Mag_fix_en=1;
+        Gyro_fix_en=1;
+        Acc_fix_en=1;
+        %快速修正模式
+        Mag_reset=1;
+        Gyro_reset=1;
+        Acc_reset=1;
+        %修正系数
+        reset_cnt=0;
+        akp_use=0;
+        aki_use=0;
+        mkp_use=0;
+        %角度误差向量：加速度修正
+        vec_err=zeros(1,3);
+        %加速度修正积分
+        vec_err_i=zeros(1,3);
+        %体坐标系磁力计向量在导航坐标系的投影
+        w_xy_mag_norm=zeros(1,2);
+        %obj.delta_angle=0.5*dt*wi
+        delta_angle=zeros(1,3);
+        %磁北方向在水平面的投影
+        wxy_north_mag=[1,0];
+    end
+    methods(Access=private)
+        function IMU_update(obj,dt,gyro,accel,mag)
+            %{
+                描述：姿态更新函数
+                参数:dt:    IMU采样时间间隔，默认为加速度采样时间间隔
+                     gyro:  机体坐标系下当前时间角速度向量，维度[1,3]
+                     accel: 机体坐标系下当前时间加速度向量，维度[1,3]
+                     mag:   机体坐标系下当前时间磁场向量，维度[1,3]
+            %}
+            %存放上一个解算结果
+            q_prev=obj.imu.q;
+            
+            %{
+                %考虑去除运动加速度的影响
+                if obj.imu_cali.accel_stable
+                    obj.imu.grav_acc=accel-obj.imu.m_acc;
+                else
+                    obj.imu.grav_acc=accel;
+                end
+            %}
+            obj.imu.grav_acc=accel;
+            %加速度计读数单位化
+            acc_norm_l=norm(obj.imu.grav_acc);
+            if acc_norm_l>eps
+               acc_norm=obj.imu.grav_acc/acc_norm_l;
+            else
+                acc_norm=[0,0,0];
+            end
+            %获取姿态矩阵和投影向量
+            %{
+                q_vec=compact(q_prev);
+                q0q1 = q_vec(1) * q_vec(2);
+                q0q2 = q_vec(1) * q_vec(3);
+                q1q1 = q_vec(2) * q_vec(2);
+                q1q3 = q_vec(2) * q_vec(4);
+                q2q2 = q_vec(3) * q_vec(3);
+                q2q3 = q_vec(3) * q_vec(4);
+                q3q3 = q_vec(4) * q_vec(4);
+                q1q2 = q_vec(2) * q_vec(3);
+                q0q3 = q_vec(1) * q_vec(4);
+                % 载体坐标下的x方向向量，单位化。
+                obj.rotate_matrix(1,1) = 1 - (2*q2q2 + 2*q3q3);
+                obj.rotate_matrix(1,2) = 2*q1q2 - 2*q0q3;
+                obj.rotate_matrix(1,3) = 2*q1q3 + 2*q0q2;
+                    
+                % 载体坐标下的y方向向量，单位化。
+                obj.rotate_matrix(2,1) = 2*q1q2 + 2*q0q3;
+                obj.rotate_matrix(2,2) = 1 - (2*q1q1 + 2*q3q3);
+                obj.rotate_matrix(2,3) = 2*q2q3 - 2*q0q1;
+                    
+                % 载体坐标下的z方向向量（等效重力向量、重力加速度向量），单位化。
+                obj.rotate_matrix(3,1) = 2*q1q3 - 2*q0q2;
+                obj.rotate_matrix(3,2) = 2*q2q3 + 2*q0q1;
+                obj.rotate_matrix(3,3) = 1 - (2*q1q1 + 2*q2q2);
+                
+                %投影向量
+                obj.x_vec=obj.rotate_matrix(1,:);
+                obj.y_vec=obj.rotate_matrix(2,:);
+                obj.z_vec=obj.rotate_matrix(3,:);
+            %}
+            q_prev_inv=quatinv(q_prev);
+            obj.rotate_matrix=rotmat(q_prev_inv,"frame");
+            %obj.rotate_matrix=rotmat(q_prev,"frame")';
+            obj.x_vec=obj.rotate_matrix(1,:);
+            obj.y_vec=obj.rotate_matrix(2,:);
+            obj.z_vec=obj.rotate_matrix(3,:);
+            %计算水平面方向向量
+            xb_xy=[1,0];%体坐标系x轴在导航坐标系水平面的投影
+            xb_xy(1)=obj.rotate_matrix(1,1);
+            xb_xy(2)=obj.rotate_matrix(2,1);
+            obj.hx_vec=normalize(xb_xy,2);%归一化
+            %计算运动加速度(与姿态结算无关 )
+                obj.imu.m_acc=accel-obj.gravAcc*obj.z_vec;%载体坐标
+                obj.imu.w_acc=rotateframe(q_prev,obj.imu.m_acc);%转到导航坐标系
+                %将导航坐标系水平面的加速度转化为沿着机头和垂直机头的加速度
+                obj.imu.h_acc=obj.w2h_2d_trans(obj.imu.w_acc,obj.hx_vec);
+            
+            %{
+                obj.vec_err(1) =   acc_norm(2)*obj.z_vec(3) - obj.z_vec(2)*acc_norm(3);
+                obj.vec_err(2) = -(acc_norm(1)*obj.z_vec(3) - obj.z_vec(1)*acc_norm(3));
+                obj.vec_err(3) = -(acc_norm(2)*obj.z_vec(1) - obj.z_vec(2)*acc_norm(1));
+            %}
+            obj.vec_err=cross(acc_norm,obj.z_vec);
+            %处理电子罗盘数据
+            obj.imu.w_mag=rotateframe(q_prev_inv,mag);
+
+            obj.w_xy_mag_norm=obj.imu.w_mag(1:2)/norm(obj.imu.w_mag(1:2));
+            %计算南北朝向误差(叉乘)
+
+            mag_yaw_err=obj.my_cross(obj.w_xy_mag_norm,obj.wxy_north_mag);
+            %计算南北朝向向量点乘，判断同向或反向
+            mag_err_dot_prudoct=dot(obj.w_xy_mag_norm,obj.wxy_north_mag);
+            %若反向，直接给最大误差
+            if mag_err_dot_prudoct<0
+                mag_yaw_err=sign(mag_yaw_err);
+            end
+            %将导航坐标系中yaw误差转化为体坐标系中z轴角速度误差
+            mag_yaw_gyr_err=obj.z_vec.*mag_yaw_err;
+            %死区设置
+            for i=1:3
+                obj.vec_err(i)=obj.my_deadzone(obj.vec_err(i),0,obj.imu.gacc_deadzone(i));
+            end
+            %抗积分饱和
+            if obj.USE_LENGTH_LIM
+                if acc_norm_l>10.6 || acc_norm_l<9.0
+                    for i=1:3
+                        obj.vec_err(i)=0;
+                    end
+                end
+            end
+            %误差积分
+            for i=1:3
+                obj.vec_err_i(i)=obj.vec_err_i(i)+obj.LIMIT(obj.vec_err(i),-0.1,0.1)*obj.dt;%#ok<*AGROW>
+            end
+            %delta_angle=0.5*dt*wi
+            obj.delta_angle=(obj.USE_GYR*(gyro)+...
+                         obj.USE_ACC*(obj.akp_use*obj.vec_err+obj.aki_use*obj.vec_err_i)+...
+                         obj.USE_MAG*(mag_yaw_gyr_err*obj.mkp_use))*dt/2;  
+            %更新姿态
+            obj.Omega = [1,                  -obj.delta_angle(1),  -obj.delta_angle(2),  -obj.delta_angle(3);
+                         obj.delta_angle(1), 1,                    obj.delta_angle(3),  -obj.delta_angle(2);
+                         obj.delta_angle(2), -obj.delta_angle(3),   1,                    obj.delta_angle(1);
+                         obj.delta_angle(3), obj.delta_angle(2),  -obj.delta_angle(1),   1               ];
+            q_prev_vec=compact(q_prev)';
+            q_new_vec=obj.Omega*q_prev_vec;
+            obj.imu.q=quaternion(q_new_vec');
+            obj.imu.q=quatnormalize(obj.imu.q);
+            %修正开关
+            %磁力计修正
+            if obj.Mag_fix_en==0
+                obj.mkp_use=0;%禁止磁力计修正
+                obj.Mag_reset=0;%罗盘修正不复位，清除复位标记
+            else
+                if obj.Mag_reset
+                    obj.mkp_use=10;%快速校正
+                    if mag_yaw_err~=0 && abs(mag_yaw_err)<0.01
+                        obj.Mag_reset=0;%若误差已经降低，则退出快速校准
+                    end
+                else
+                    obj.mkp_use=obj.config.filtercoef.kp_mag;
+                end
+            end
+            %加速计修正
+            if obj.Acc_fix_en==0
+                obj.akp_use=0;%禁止加速度修正
+                obj.aki_use=0;
+            else
+                if obj.Acc_reset==0
+                    obj.akp_use=obj.config.filtercoef.kp_accel;
+                    obj.aki_use=obj.config.filtercoef.ki_accel;
+                else
+                    obj.akp_use=10;
+                    obj.aki_use=0;
+
+                    imu_reset_val=abs(obj.vec_err(1))+abs(obj.vec_err(2));
+                    imu_reset_val = obj.LIMIT(imu_reset_val,0,1.0);
+
+                    if(imu_reset_val<0.02)
+                        obj.reset_cnt=obj.reset_cnt+2;
+                        if obj.reset_cnt>400
+                            obj.reset_cnt=0;
+                            obj.Acc_reset=0;
+                        end
+                    else
+                        obj.reset_cnt=0;
+                    end
+                    
+                end
+            end
+            
+        end
+        %imu数据处理函数
+        function Data_process(obj)
+            %数据更新，用偏差纠正数据值
+            obj.imu.accel.value=obj.imu.accel.value-obj.imu.accel.bias;
+            obj.imu.gyro.value=obj.imu.gyro.value-obj.imu.gyro.bias;
+            obj.imu.mag.value=obj.imu.mag.value-obj.imu.mag.bias;
+        end
+    end
+
+    %% 自定义数学函数
+    methods(Static=true)
+        %一阶低通滤波器
+        function result=LPF_1_(hz,dt,in,out)
+            out =out + ( 1 / ( 1 + 1 / (hz*2.0*pi*dt) ) ) *( in - out );
+            result=out;
+        end
+        %死区滤波
+        function out=my_deadzone(in,ref,zoom)
+            if in>ref-zoom && in<ref+zoom
+                out=ref;
+            elseif in>=ref+zoom
+                out=in-zoom;
+            else
+                out=in+zoom;
+            end
+        end
+        %限幅函数
+        function out=LIMIT(in,min,max)
+            if in<min
+                out=min;
+            elseif in>max
+                out=max;
+            else 
+                out=in;
+            end
+        end
+        %叉乘函数
+        function out=my_cross(vec_a,vec_b)
+            %out=cross(a,b)
+            out=vec_a(1)*vec_b(2)-vec_a(2)*vec_b(1);
+        end
+    end
+    %% 坐标系转换函数
+    methods(Static=true)
+        %平面航向坐标XY转世界坐标平面XY
+        function head=w2h_2d_trans(w,ref_ax)
+            %参数：
+            %{
+                w:      世界坐标系下定义的向量(维度[1,3])
+                ref_ax：航向坐标系x轴在世界坐标系的投影(维度[1,3])
+                head：  w转化后的向量(维度[1,3])
+            %}
+            %定义旋转矩阵
+            head=zeros(1,3);
+            rotateM=[ref_ax(1),ref_ax(2);
+                     -ref_ax(2),ref_ax(1)];
+            Wxy=w(1:2)';
+            head(1:2)=(rotateM*Wxy)';
+        end
+    end
+end
+
