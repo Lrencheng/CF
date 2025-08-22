@@ -182,7 +182,7 @@ sequenceDiagram
 
 ## 仿真结果
 
-！[仿真结果](pic/pic1.png)
+![仿真结果](pic/pic1.png)
 
 ## 不足与挖坑
 
